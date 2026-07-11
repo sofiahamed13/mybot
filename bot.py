@@ -3,31 +3,34 @@ import os
 import json
 import asyncio
 import logging
+import warnings
 from urllib.parse import quote
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 from playwright.async_api import async_playwright
+
+# suppress PyNaCl warning
+warnings.filterwarnings("ignore", message="PyNaCl is not installed")
+logging.getLogger("discord.voice_client").setLevel(logging.CRITICAL)
 
 # =============================================================
 # LOGGING
 # =============================================================
 logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(message)s",
-    datefmt="%H:%M"
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
 )
 log = logging.getLogger("bot")
-log.setLevel(logging.INFO)
 
 # =============================================================
 # CONFIG
 # =============================================================
-TOKEN        = os.environ.get("DISCORD_TOKEN", "").strip()
-GRND_SID     = os.environ.get("GRND_SID", "").strip()
-I18N         = os.environ.get("I18N_REDIRECTED", "en").strip()
-
+TOKEN         = os.environ.get("DISCORD_TOKEN", "").strip()
+GRND_SID      = os.environ.get("GRND_SID", "").strip()
+I18N          = os.environ.get("I18N_REDIRECTED", "en").strip()
 TARGET_REGION = os.environ.get("TARGET_REGION", "eu").strip()
 TARGET_SERVER = os.environ.get("TARGET_SERVER", "2 [eu]").strip()
 
@@ -41,9 +44,6 @@ ALLOWED_USER_IDS = {
     if x.strip().isdigit()
 }
 
-NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0"))
-BG_INTERVAL       = int(os.environ.get("CHECK_INTERVAL", "4"))
-
 BASE_URL        = "https://grnd.gg"
 COMPLAINTS_URL  = BASE_URL + "/admin/complaints"
 COMP_DETAIL_URL = BASE_URL + "/admin/complaints/eu/"
@@ -52,7 +52,7 @@ DISCORD_MSG_LIMIT = 1950
 EMBED_FIELD_LIMIT = 1024
 
 # =============================================================
-# EMOJI CONFIG  ← animated emoji এখানে replace করুন
+# EMOJI CONFIG ← animated emoji এখানে replace করুন
 # =============================================================
 EMOJI_PENDING   = os.environ.get("EMOJI_PENDING",   "⏳")
 EMOJI_CLOSED    = os.environ.get("EMOJI_CLOSED",    "🔒")
@@ -61,7 +61,6 @@ EMOJI_FROM_VAL  = os.environ.get("EMOJI_FROM_VAL",  "▸")
 EMOJI_ABOUT     = os.environ.get("EMOJI_ABOUT",     "🎯")
 EMOJI_ABOUT_VAL = os.environ.get("EMOJI_ABOUT_VAL", "▸")
 EMOJI_JUDGE     = os.environ.get("EMOJI_JUDGE",     "⚖️")
-EMOJI_NEW       = os.environ.get("EMOJI_NEW",       "🔥")
 
 COLOR_PENDING = 0x3FE914
 COLOR_CLOSED  = 0xFF0505
@@ -77,8 +76,6 @@ DESKTOP_UA = (
 # =============================================================
 intents = discord.Intents.default()
 intents.message_content = True
-intents.guilds           = True
-intents.messages         = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -88,24 +85,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 playwright_instance = None
 browser_instance    = None
 browser_context     = None
-monitor_page        = None
-monitor_ready       = False          # filter সঠিকভাবে সেট হয়েছে কিনা
-
-last_known_count = -1
-notify_enabled   = False
-
-notify_lock = None
-scrape_lock = None
+scrape_lock         = None
 
 # =============================================================
 # HELPERS
 # =============================================================
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
-
-
-def build_mention_str() -> str:
-    return " ".join(f"<@{uid}>" for uid in ALLOWED_USER_IDS)
 
 
 def truncate(text: str, limit: int) -> str:
@@ -365,77 +351,6 @@ SUMMARY_JS = r"""
 }
 """
 
-# ★ COUNT + RE-FILTER: reload হলে filter চেক করে, না থাকলে আবার সেট করে
-COUNT_WITH_REFILTER_JS = r"""
-(args) => {
-    const targetRegion = args.targetRegion;
-    const targetServer = args.targetServer;
-
-    function txt(el){ return el?(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim():''; }
-    function clickEl(el){
-        if(!el)return;
-        try{el.click();}catch(e){}
-        try{const ev=document.createEvent('MouseEvents');ev.initEvent('click',true,true);el.dispatchEvent(ev);}catch(e){}
-    }
-    function chooseItem(keyword){
-        const items=document.querySelectorAll('.select-component-li');
-        for(let i=0;i<items.length;i++){
-            const t=txt(items[i]);
-            if(t===keyword||t.indexOf(keyword)!==-1){clickEl(items[i]);return true;}
-        }
-        return false;
-    }
-
-    function getCount(){
-        const activeDivs=document.querySelectorAll('div.active');
-        for(let i=0;i<activeDivs.length;i++){
-            const t=txt(activeDivs[i]);
-            if(t.indexOf('New')!==-1){
-                const m=t.match(/New\s*\(\s*(\d+)\s*\)/i);
-                if(m)return parseInt(m[1],10);
-            }
-        }
-        return document.querySelectorAll('tbody tr').length;
-    }
-
-    function isFilterActive(){
-        const selectors=document.querySelectorAll('.select-component');
-        for(let i=0;i<selectors.length;i++){
-            const t=txt(selectors[i]);
-            if(t.indexOf(targetRegion)!==-1||t.indexOf(targetServer)!==-1) return true;
-        }
-        // check if any selected value visible
-        const selected=document.querySelectorAll('.select-component .selected-value, .select-component .value');
-        for(let i=0;i<selected.length;i++){
-            const t=txt(selected[i]);
-            if(t.indexOf(targetRegion)!==-1||t.indexOf(targetServer)!==-1) return true;
-        }
-        return false;
-    }
-
-    return new Promise((resolve)=>{
-        // চেক করো filter active আছে কিনা
-        // সবসময় re-apply filter করবো safety-র জন্য
-        const selectors=document.querySelectorAll('.select-component');
-        if(selectors.length>=1) clickEl(selectors[0]);
-
-        setTimeout(()=>{
-            chooseItem(targetRegion);
-            setTimeout(()=>{
-                const selectors2=document.querySelectorAll('.select-component');
-                if(selectors2.length>=2) clickEl(selectors2[1]);
-                setTimeout(()=>{
-                    chooseItem(targetServer);
-                    setTimeout(()=>{
-                        resolve(getCount());
-                    },1200);
-                },500);
-            },600);
-        },500);
-    });
-}
-"""
-
 DETAIL_JS = r"""
 () => {
     function txt(el){ return el?(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim():''; }
@@ -516,12 +431,9 @@ DETAIL_JS = r"""
 # BROWSER SETUP
 # =============================================================
 async def setup_browser():
-    global playwright_instance, browser_instance, browser_context
-    global monitor_page, monitor_ready
-    global notify_lock, scrape_lock
+    global playwright_instance, browser_instance, browser_context, scrape_lock
 
-    notify_lock = notify_lock or asyncio.Lock()
-    scrape_lock = scrape_lock or asyncio.Lock()
+    scrape_lock = asyncio.Lock()
 
     playwright_instance = await async_playwright().start()
     browser_instance = await playwright_instance.chromium.launch(
@@ -540,88 +452,11 @@ async def setup_browser():
     if cookies:
         await browser_context.add_cookies(cookies)
 
-    monitor_page = await browser_context.new_page()
-    await monitor_page.goto(COMPLAINTS_URL, wait_until="domcontentloaded", timeout=30000)
-    await monitor_page.wait_for_timeout(2000)
-    await monitor_page.evaluate(
-        SELECT_DROPDOWN_JS,
-        {"targetRegion": TARGET_REGION, "targetServer": TARGET_SERVER}
-    )
-    await monitor_page.wait_for_timeout(2000)
-    monitor_ready = True
-    log.info("Browser ready — monitor page with filters set")
-
-
-async def rebuild_monitor_page():
-    """Monitor page crash হলে নতুন করে তৈরি করে"""
-    global monitor_page, monitor_ready
-    monitor_ready = False
-    try:
-        if monitor_page:
-            await monitor_page.close()
-    except Exception:
-        pass
-    monitor_page = None
-    try:
-        monitor_page = await browser_context.new_page()
-        await monitor_page.goto(COMPLAINTS_URL, wait_until="domcontentloaded", timeout=25000)
-        await monitor_page.wait_for_timeout(2000)
-        await monitor_page.evaluate(
-            SELECT_DROPDOWN_JS,
-            {"targetRegion": TARGET_REGION, "targetServer": TARGET_SERVER}
-        )
-        await monitor_page.wait_for_timeout(2000)
-        monitor_ready = True
-        log.info("Monitor page rebuilt successfully")
-    except Exception as e:
-        log.warning(f"Failed to rebuild monitor page: {e}")
-        monitor_page = None
-        monitor_ready = False
-
-
-async def close_browser():
-    global monitor_page, browser_context, browser_instance, playwright_instance
-    for obj in [monitor_page, browser_context, browser_instance]:
-        if obj:
-            try:
-                await obj.close()
-            except Exception:
-                pass
-    if playwright_instance:
-        try:
-            await playwright_instance.stop()
-        except Exception:
-            pass
+    log.info("Browser ready")
 
 # =============================================================
-# SCRAPERS
+# SCRAPERS (on-demand only)
 # =============================================================
-async def quick_count_check() -> int:
-    """
-    Monitor page reload + filter re-apply → সঠিক filtered count পায়।
-    """
-    global monitor_page, monitor_ready
-
-    if not monitor_page or not browser_context:
-        return -1
-
-    try:
-        await monitor_page.reload(wait_until="domcontentloaded", timeout=15000)
-        await monitor_page.wait_for_timeout(800)
-
-        # ★ reload হলে filter উড়ে যেতে পারে, তাই প্রতিবার re-apply
-        count = await monitor_page.evaluate(
-            COUNT_WITH_REFILTER_JS,
-            {"targetRegion": TARGET_REGION, "targetServer": TARGET_SERVER}
-        )
-        monitor_ready = True
-        return int(count)
-    except Exception as e:
-        log.warning(f"quick_count_check error: {e}")
-        await rebuild_monitor_page()
-        return -1
-
-
 async def live_scrape_summary():
     if not browser_context:
         return False, "Browser not ready"
@@ -671,75 +506,23 @@ async def live_scrape_comp(comp_id):
                 pass
 
 # =============================================================
-# BACKGROUND CHECK — প্রতি 4 সেকেন্ডে
-# =============================================================
-@tasks.loop(seconds=BG_INTERVAL)
-async def background_check():
-    global last_known_count
-
-    count = await quick_count_check()
-    if count == -1:
-        return
-
-    # প্রথমবার baseline সেট — notify না
-    if last_known_count == -1:
-        last_known_count = count
-        log.info(f"Baseline count set: {count}")
-        return
-
-    # ★ শুধুমাত্র বাড়লে notify, কমলে বা সমান থাকলে চুপ
-    if count > last_known_count:
-        diff = count - last_known_count
-        log.info(f"Count changed: {last_known_count} → {count} (+{diff})")
-
-        async with notify_lock:
-            should_notify = notify_enabled
-
-        if should_notify and NOTIFY_CHANNEL_ID:
-            channel = bot.get_channel(NOTIFY_CHANNEL_ID)
-            if channel:
-                mentions = build_mention_str()
-                try:
-                    await channel.send(
-                        f"{EMOJI_NEW} **{diff} New Complaint(s)!** "
-                        f"Total pending: **{count}**\n{mentions}"
-                    )
-                except Exception as e:
-                    log.warning(f"Notify send error: {e}")
-
-        # ★ সবসময় count আপডেট করো (notify on/off যাই হোক)
-        last_known_count = count
-    elif count < last_known_count:
-        # কমলে (complaint closed/resolved হলে) baseline আপডেট, notify না
-        log.info(f"Count decreased: {last_known_count} → {count} (updating baseline)")
-        last_known_count = count
-    # সমান হলে কিছু করো না
-
-
-@background_check.before_loop
-async def before_background():
-    await bot.wait_until_ready()
-
-# =============================================================
 # EVENTS
 # =============================================================
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} ({bot.user.id})")
+
+    if browser_context is None:
+        await setup_browser()
+
     try:
         synced = await bot.tree.sync()
         log.info(f"Synced {len(synced)} slash commands")
     except Exception as e:
         log.warning(f"Slash sync failed: {e}")
 
-    if browser_context is None:
-        await setup_browser()
-
-    if not background_check.is_running():
-        background_check.start()
-
 # =============================================================
-# MESSAGE COMMANDS
+# MESSAGE COMMANDS (!jb / jb  and  !comp / comp)
 # =============================================================
 @bot.event
 async def on_message(message):
@@ -815,7 +598,7 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # =============================================================
-# SLASH COMMANDS
+# SLASH COMMANDS (only /jb and /comp)
 # =============================================================
 @bot.tree.command(name="jb", description="Show complaint summary (live)")
 @app_commands.describe(count="Number of complaints or 'all' (default: 3)")
@@ -863,113 +646,6 @@ async def comp_slash(interaction: discord.Interaction, complaint_id: str):
     await interaction.followup.send(embeds=embeds[:10])
     for i in range(10, len(embeds), 10):
         await interaction.channel.send(embeds=embeds[i:i+10])
-
-
-@bot.tree.command(name="on", description="Enable new complaint notifications")
-async def notify_on(interaction: discord.Interaction):
-    global notify_enabled, last_known_count
-
-    if not is_allowed(interaction.user.id):
-        await interaction.response.send_message("No access", ephemeral=True)
-        return
-
-    await interaction.response.defer(thinking=True)
-
-    # ★ সাথে সাথে current count নাও → baseline হিসেবে সেট করো
-    current = await quick_count_check()
-
-    async with notify_lock:
-        notify_enabled = True
-        if current != -1:
-            last_known_count = current
-
-    mentions  = build_mention_str()
-    count_str = str(current) if current != -1 else "unknown"
-
-    await interaction.followup.send(
-        f"✅ Notifications **ON**\n"
-        f"Current complaint count: **{count_str}**\n"
-        f"Only **new** complaints from now will trigger notifications.\n"
-        f"{mentions}"
-    )
-
-
-@bot.tree.command(name="off", description="Disable new complaint notifications")
-async def notify_off(interaction: discord.Interaction):
-    global notify_enabled
-
-    if not is_allowed(interaction.user.id):
-        await interaction.response.send_message("No access", ephemeral=True)
-        return
-
-    async with notify_lock:
-        notify_enabled = False
-
-    mentions = build_mention_str()
-    await interaction.response.send_message(
-        f"🔴 Notifications **OFF** — Bot stays online, commands still work.\n{mentions}"
-    )
-
-
-@bot.tree.command(name="status", description="Check bot status")
-async def status_cmd(interaction: discord.Interaction):
-    if not is_allowed(interaction.user.id):
-        await interaction.response.send_message("No access", ephemeral=True)
-        return
-    async with notify_lock:
-        ns = notify_enabled
-    await interaction.response.send_message(
-        f"**Bot Status**\n"
-        f"• Browser: {'✅ Ready' if browser_context else '❌ Not ready'}\n"
-        f"• Monitor page: {'✅ Ready' if monitor_ready else '❌ Not ready'}\n"
-        f"• Notifications: {'✅ ON' if ns else '🔴 OFF'}\n"
-        f"• Last count: **{last_known_count}**\n"
-        f"• Check interval: **{BG_INTERVAL}s**\n"
-        f"• Notify channel: `{NOTIFY_CHANNEL_ID}`",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="delete", description="Delete ALL messages in the notification channel")
-async def delete_messages(interaction: discord.Interaction):
-    if not is_allowed(interaction.user.id):
-        await interaction.response.send_message("No access", ephemeral=True)
-        return
-    if not NOTIFY_CHANNEL_ID:
-        await interaction.response.send_message(
-            "NOTIFY_CHANNEL_ID is not configured.", ephemeral=True
-        )
-        return
-    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
-    if not channel:
-        await interaction.response.send_message(
-            "Cannot find the notification channel.", ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    deleted_total = 0
-    try:
-        while True:
-            deleted = await channel.purge(limit=100)
-            deleted_total += len(deleted)
-            if len(deleted) < 100:
-                break
-            await asyncio.sleep(1)
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "❌ Missing permissions to delete messages.", ephemeral=True
-        )
-        return
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-        return
-
-    await interaction.followup.send(
-        f"✅ Deleted **{deleted_total}** message(s) from <#{NOTIFY_CHANNEL_ID}>.",
-        ephemeral=True
-    )
 
 # =============================================================
 # RUN
